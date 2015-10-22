@@ -3,7 +3,7 @@ machine:
     version: oraclejdk8
 dependencies:
   pre:
-    - wget https://dl.bintray.com/sbt/debian/sbt-0.13.8.deb
+    - wget https://dl.bintray.com/sbt/debian/sbt-0.13.9.deb
     - sudo dpkg -i sbt-0.13.8.deb
 
   cache_directories:
