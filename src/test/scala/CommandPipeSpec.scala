@@ -5,6 +5,7 @@ import akka.stream.scaladsl.{Sink, Source}
 import akka.util.ByteString
 import io.dronekit.cloud.ExternalCommandFlow
 import org.scalatest._
+import java.io.File
 
 import scala.concurrent.Await
 import scala.concurrent.duration._
@@ -33,6 +34,10 @@ class CommandPipeSpec extends FlatSpec with Matchers {
       Await.result(stream, 1 seconds)
     }
   }
+  val falseCommand =
+    if (new File("/usr/bin/false").exists) "/usr/bin/false"
+    else if (new File("/bin/false").exists) "/bin/false"
+    else "false"
 
   it should "allow giving arguments to binaries" in {
     val inputString =
@@ -52,7 +57,7 @@ class CommandPipeSpec extends FlatSpec with Matchers {
   // This test is not the best... but does check some error handling
   it should "close java streams on error from the command" in {
     val f = Source.single(ByteString("hello"))
-      .via(ExternalCommandFlow(Seq("/usr/bin/false")))
+      .via(ExternalCommandFlow(Seq(falseCommand)))
       .runWith(Sink.ignore)
     val result = Await.result(f, 1 seconds)
   }
