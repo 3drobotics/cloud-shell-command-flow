@@ -47,10 +47,8 @@ object ExternalCommandFlow {
      */
     def processInput(in: OutputStream): Unit = {
       while (!upstreamFinished.get && !errorAbort.get) {
-        if (inputQueue.isEmpty)
-          Thread.`yield`()
-        else
-          in.write(inputQueue.takeLast().toArray[Byte])
+        // Block until there is data available
+        in.write(inputQueue.takeLast().toArray[Byte])
       }
       // Make sure we wrote everything to the input stream
       try {
@@ -152,6 +150,8 @@ object ExternalCommandFlow {
 
     override def onUpstreamFinish(ctx: Context[String]): TerminationDirective = {
       upstreamFinished.set(true)
+      // This un-blocks processInput allowing it to exit
+      inputQueue.putFirst(ByteString())
       ctx.absorbTermination()
     }
   }
