@@ -2,6 +2,7 @@ package io.dronekit.cloud
 
 import java.io.{IOException, InputStream, OutputStream}
 import java.util.concurrent.LinkedBlockingDeque
+import java.util.concurrent.atomic.AtomicBoolean
 
 import akka.event.LoggingAdapter
 import akka.stream.scaladsl.Flow
@@ -29,10 +30,10 @@ object ExternalCommandFlow {
 
 
   private class PipeThroughCommand(command: Seq[String])(implicit adapter: LoggingAdapter) extends PushPullStage[ByteString, String] {
-    var upstreamFinished = false
-    var inputClosed = false
-    var outputClosed = false
-    var errorAbort = false
+    var upstreamFinished = new AtomicBoolean(false)
+    var inputClosed = new AtomicBoolean(false)
+    var outputClosed = new AtomicBoolean(false)
+    var errorAbort = new AtomicBoolean(false)
     val process = Process(command)
     val inputQueue = new LinkedBlockingDeque[ByteString]()
     val outputQueue = new LinkedBlockingDeque[String]()
@@ -45,17 +46,15 @@ object ExternalCommandFlow {
      * @param in OutputStream to write to, which is Input for the process
      */
     def processInput(in: OutputStream): Unit = {
-      while (!upstreamFinished && !errorAbort) {
+      while (!upstreamFinished.get && !errorAbort.get) {
         if (inputQueue.isEmpty)
           Thread.`yield`()
-        else {
+        else
           in.write(inputQueue.takeLast().toArray[Byte])
-        }
       }
       // Make sure we wrote everything to the input stream
       try {
-
-        while (!inputQueue.isEmpty && !errorAbort) {
+        while (!inputQueue.isEmpty && !errorAbort.get) {
           in.write(inputQueue.takeLast().toArray[Byte])
         }
         in.close()
@@ -66,7 +65,7 @@ object ExternalCommandFlow {
           else
             throw ex
       }
-      inputClosed = true
+      inputClosed.set(true)
     }
 
     /**
@@ -76,7 +75,7 @@ object ExternalCommandFlow {
      * @param out An InputStream which is connected to the process's stdout
      */
     def processOutput(out: InputStream): Unit = {
-      while (!inputClosed && !errorAbort) {
+      while (!inputClosed.get && !errorAbort.get) {
         scala.io.Source.fromInputStream(out)
           .getLines()
           .foreach{line => outputQueue.putFirst(line)}
@@ -84,13 +83,13 @@ object ExternalCommandFlow {
           Thread.`yield`()
       }
       // Finish up anything remaining in the stream
-      while (out.available() > 0 && !errorAbort) {
+      while (out.available() > 0 && !errorAbort.get) {
         scala.io.Source.fromInputStream(out)
           .getLines()
           .foreach{line => outputQueue.putFirst(line)}
       }
       out.close()
-      outputClosed = true
+      outputClosed.set(true)
     }
 
     /**
@@ -99,10 +98,10 @@ object ExternalCommandFlow {
      * @param err An InputStream which is attached to the process's stderr output
      */
     def processErrorOutput(err: InputStream): Unit = {
-      while (!inputClosed || !outputClosed || errorAbort) {
+      while (!inputClosed.get || !outputClosed.get || errorAbort.get) {
         scala.io.Source.fromInputStream(err)
           .getLines()
-          .foreach{msg => println(s"caught error: $msg"); errorQueue.putFirst(msg)}
+          .foreach{msg => adapter.error(s"caught error: $msg"); errorQueue.putFirst(msg)}
       }
       err.close()
     }
@@ -135,7 +134,7 @@ object ExternalCommandFlow {
 
       if (ctx.isFinishing) {
         // Upstream is finished, need to emit all of the piped output
-        if (inputClosed && outputClosed) {
+        if (inputClosed.get && outputClosed.get) {
           val finalPush = outputQueue.descendingIterator().mkString("\n")
           ctx.pushAndFinish(finalPush)
         }
@@ -152,7 +151,7 @@ object ExternalCommandFlow {
     }
 
     override def onUpstreamFinish(ctx: Context[String]): TerminationDirective = {
-      upstreamFinished = true
+      upstreamFinished.set(true)
       ctx.absorbTermination()
     }
   }
