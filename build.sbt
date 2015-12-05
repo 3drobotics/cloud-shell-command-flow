@@ -2,7 +2,7 @@ name := "AkkaStreamsCommandPipe"
 
 organization := "io.dronekit"
 
-version := "1.0"
+version := "1.1-M2"
 
 scalaVersion := "2.11.7"
 
@@ -23,10 +23,11 @@ publishTo := {
 }
 
 libraryDependencies ++= {
+  val akkaStreamV = "2.0-M2"
   Seq(
-    "com.typesafe.akka" %% "akka-stream-experimental" % "1.0",
-    "com.typesafe.akka" %% "akka-stream-testkit-experimental" % "1.0" % "test",
-    "com.typesafe.akka" %% "akka-testkit" % "2.3.12" % "test",
+    "com.typesafe.akka" %% "akka-stream-experimental" % akkaStreamV,
+    "com.typesafe.akka" %% "akka-stream-testkit-experimental" % akkaStreamV % "test",
+    "com.typesafe.akka" %% "akka-testkit" % "2.4.1" % "test",
     "org.scalatest" %% "scalatest" % "2.2.4" % "test"
   )
 }

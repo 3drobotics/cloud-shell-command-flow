@@ -5,8 +5,9 @@ import java.util.concurrent.LinkedBlockingDeque
 import java.util.concurrent.atomic.AtomicBoolean
 
 import akka.event.LoggingAdapter
+import akka.stream._
 import akka.stream.scaladsl.Flow
-import akka.stream.stage.{Context, PushPullStage, SyncDirective, TerminationDirective}
+import akka.stream.stage._
 import akka.util.ByteString
 
 import scala.collection.JavaConversions._
@@ -17,142 +18,170 @@ import scala.sys.process.{Process, ProcessIO}
  *
  */
 object ExternalCommandFlow {
-  def apply(command: Seq[String])(implicit adapter: LoggingAdapter): Flow[ByteString, String, Any] = {
-   Flow() {implicit b =>
-     val flow = b.add(
-       Flow[ByteString]
-         .transform(() => new PipeThroughCommand(command))
-         .filter(elem => elem != "")
-     )
-     (flow.inlet, flow.outlet)
-   }
+  def apply(command: Seq[String])(implicit log: LoggingAdapter): Flow[ByteString, String, Unit] = {
+    Flow.fromGraph(new ShellCommandFlow(command))
   }
 
+  class ShellCommandFlowException(msg: String) extends RuntimeException(msg)
 
-  private class PipeThroughCommand(command: Seq[String])(implicit adapter: LoggingAdapter) extends PushPullStage[ByteString, String] {
-    var upstreamFinished = new AtomicBoolean(false)
-    var inputClosed = new AtomicBoolean(false)
-    var outputClosed = new AtomicBoolean(false)
-    var errorAbort = new AtomicBoolean(false)
-    val process = Process(command)
-    val inputQueue = new LinkedBlockingDeque[ByteString]()
-    val outputQueue = new LinkedBlockingDeque[String]()
-    val errorQueue = new LinkedBlockingDeque[String]()
 
-    /**
-     * Executed in a separate thread, this method is responsible for
-     * writing the data from the Akka Stream onPush to the process's
-     * InputStream (which is an OutputStream for us)
-     * @param in OutputStream to write to, which is Input for the process
-     */
-    def processInput(in: OutputStream): Unit = {
-      while (!upstreamFinished.get && !errorAbort.get) {
-        // Block until there is data available
-        in.write(inputQueue.takeLast().toArray[Byte])
-      }
-      // Make sure we wrote everything to the input stream
-      try {
-        while (!inputQueue.isEmpty && !errorAbort.get) {
-          in.write(inputQueue.takeLast().toArray[Byte])
+  private class ShellCommandFlow(command: Seq[String], bufferSize: Int = 10)
+                                (implicit log: LoggingAdapter) extends GraphStage[FlowShape[ByteString, String]] {
+    val in: Inlet[ByteString] = Inlet("CommandInput")
+    val out: Outlet[String] = Outlet("CommandOutput")
+    override val shape: FlowShape[ByteString, String] = FlowShape(in, out)
+
+    sealed trait Output
+    case class StandardOutput(out: String) extends Output
+    case class ErrorOutput(out: String) extends Output
+    case object StandardOutputFinished extends Output
+
+
+    override def createLogic(inheritedAttributes: Attributes): GraphStageLogic =
+      new GraphStageLogic(shape) {
+        var upstreamFinished = new AtomicBoolean(false)
+        var inputClosed = new AtomicBoolean(false)
+        var outputClosed = new AtomicBoolean(false)
+        var errorAbort = new AtomicBoolean(false)
+        val process = Process(command)
+        val inputQueue = new LinkedBlockingDeque[ByteString]()
+        val outputQueue = new LinkedBlockingDeque[String]()
+        val errorQueue = new LinkedBlockingDeque[String]()
+        val callback = getAsyncCallback(outputAsyncInput)
+
+        val io = try {
+          new ProcessIO(processInput, processOutput, processErrorOutput)
+        } catch {
+          case e: IOException => throw new ShellCommandFlowException(e.toString)
         }
-        in.close()
-      } catch {
-        case ex: IOException =>
-          if (ex.getMessage == "Stream closed")
-            adapter.error(s"Ignoring $ex in processInput while closing")
-          else
-            throw ex
-      }
-      inputClosed.set(true)
-    }
+        // TODO: create a materialized value with the exit code
+        val runningProcess = process.run(io)
 
-    /**
-     * Executed in a separate thread, this method is responsible for reading
-     * the process's output, and writing the results to the outputQueue, which
-     * is then read by onPull and pushed downstream.
-     * @param out An InputStream which is connected to the process's stdout
-     */
-    def processOutput(out: InputStream): Unit = {
-      while (!inputClosed.get && !errorAbort.get) {
-        scala.io.Source.fromInputStream(out)
-          .getLines()
-          .foreach{line => outputQueue.putFirst(line)}
-        if (out.available() == 0)
-          Thread.`yield`()
-      }
-      // Finish up anything remaining in the stream
-      while (out.available() > 0 && !errorAbort.get) {
-        scala.io.Source.fromInputStream(out)
-          .getLines()
-          .foreach{line => outputQueue.putFirst(line)}
-      }
-      out.close()
-      outputClosed.set(true)
-    }
-
-    /**
-     * Executed in a separate thread, this method reads the stderr output from
-     * the process
-     * @param err An InputStream which is attached to the process's stderr output
-     */
-    def processErrorOutput(err: InputStream): Unit = {
-      while (!inputClosed.get || !outputClosed.get || errorAbort.get) {
-        scala.io.Source.fromInputStream(err)
-          .getLines()
-          .foreach{msg => adapter.error(s"caught error: $msg"); errorQueue.putFirst(msg)}
-      }
-      err.close()
-    }
-
-    val io = new ProcessIO(processInput, processOutput, processErrorOutput)
-    // TODO: create a materialized value with the exit code
-    val runningProcess = process.run(io)
-
-    override def onPush(elem: ByteString, ctx: Context[String]): SyncDirective = {
-      if (!errorQueue.isEmpty) {
-        // What is the right thing to do if there is stderr output?
-        adapter.error(s"""Got stderr output from $command: ${errorQueue.iterator().mkString("\n")}""")
-        errorQueue.clear()
-//        errorAbort = true
-//        ctx.fail(new RuntimeException(errorQueue.iterator().mkString))
-      }
-
-      inputQueue.putFirst(elem)
-      if (outputQueue.isEmpty)
-        ctx.pull()
-      else
-        ctx.push(outputQueue.takeLast())
-    }
-
-    override def onPull(ctx: Context[String]): SyncDirective = {
-      if (!errorQueue.isEmpty) {
-//        errorAbort = true
-//        ctx.fail(new RuntimeException(errorQueue.iterator().mkString))
-      }
-
-      if (ctx.isFinishing) {
-        // Upstream is finished, need to emit all of the piped output
-        if (inputClosed.get && outputClosed.get) {
-          val finalPush = outputQueue.descendingIterator().mkString("\n")
-          ctx.pushAndFinish(finalPush)
+        private def pushAndPull(): Unit = {
+          if (outputQueue.isEmpty && !hasBeenPulled(in) && !isClosed(in)) {
+            pull(in)
+          }
+          while (!outputQueue.isEmpty && !isClosed(out) && isAvailable(out)) {
+            val output = outputQueue.takeLast()
+            push(out, output)
+          }
         }
-        else if (outputQueue.isEmpty) {
-          ctx.push("")
-        }
-        else {
-          ctx.push(outputQueue.takeLast())
-        }
-      } else {
-        if (outputQueue.isEmpty) ctx.pull()
-        else ctx.push(outputQueue.takeLast())
-      }
-    }
 
-    override def onUpstreamFinish(ctx: Context[String]): TerminationDirective = {
-      upstreamFinished.set(true)
-      // This un-blocks processInput allowing it to exit
-      inputQueue.putFirst(ByteString())
-      ctx.absorbTermination()
-    }
+        private def outputAsyncInput(data: Output): Unit = data match {
+          case StandardOutput(msg) =>
+            outputQueue.putFirst(msg)
+            pushAndPull()
+          case ErrorOutput(msg) =>
+            log.error(msg)
+            errorQueue.putFirst(msg)
+          case StandardOutputFinished =>
+            while (!outputQueue.isEmpty && !isClosed(out)) {
+              if (isAvailable(out)) {
+                val finalPush = outputQueue.descendingIterator().mkString("\n")
+                push(out, finalPush)
+              }
+              else
+                Thread.`yield`()
+            }
+            completeStage()
+        }
+
+        setHandler(in, new InHandler{
+          override def onPush: Unit = {
+            val elem = grab(in)
+            if (!errorQueue.isEmpty) {
+              // What is the right thing to do if there is stderr output?
+              errorQueue.clear()
+            }
+
+            inputQueue.putFirst(elem)
+            pushAndPull()
+          }
+
+          override def onUpstreamFinish: Unit = {
+            upstreamFinished.set(true)
+            // This un-blocks processInput allowing it to exit
+            inputQueue.putFirst(ByteString())
+          }
+
+        })
+
+        setHandler(out, new OutHandler {
+          override def onPull(): Unit = {
+            pushAndPull()
+          }
+        })
+
+
+
+        /**
+          * Executed in a separate thread, this method is responsible for
+          * writing the data from the Akka Stream onPush to the process's
+          * InputStream (which is an OutputStream for us)
+          * @param in OutputStream to write to, which is Input for the process
+          */
+        def processInput(in: OutputStream): Unit = {
+          while (!upstreamFinished.get && !errorAbort.get) {
+            // Block until there is data available
+            val data = inputQueue.takeLast().toArray[Byte]
+            in.write(data)
+          }
+          // Make sure we wrote everything to the input stream
+          while (!inputQueue.isEmpty && !errorAbort.get) {
+            in.write(inputQueue.takeLast().toArray[Byte])
+          }
+          try {
+            in.close()
+          } catch {
+            case ex: IOException if ex.getMessage == "Stream closed" =>
+              log.error(s"Ignoring $ex in processInput while closing")
+            case ex: IOException if ex.getMessage == "Broken pipe" =>
+              log.error(s"Ignoring $ex in processInput while closing")
+          }
+          inputClosed.set(true)
+        }
+
+        /**
+          * Executed in a separate thread, this method is responsible for reading
+          * the process's output, and writing the results to the outputQueue, which
+          * is then read by onPull and pushed downstream.
+          * @param out An InputStream which is connected to the process's stdout
+          */
+        def processOutput(out: InputStream): Unit = {
+          while (!inputClosed.get && !errorAbort.get) {
+            scala.io.Source.fromInputStream(out)
+              .getLines()
+              .foreach{line => callback.invoke(StandardOutput(line))}
+            if (out.available() == 0)
+              Thread.`yield`()
+          }
+          // Finish up anything remaining in the stream
+          while (out.available() > 0 && !errorAbort.get) {
+            scala.io.Source.fromInputStream(out)
+              .getLines()
+              .foreach{line => callback.invoke(StandardOutput(line))}
+          }
+          try {
+            out.close()
+          } catch {
+            case e: IOException => log.warning("Ignoring IO Exception closing stream")
+          }
+          callback.invoke(StandardOutputFinished)
+        }
+
+        /**
+          * Executed in a separate thread, this method reads the stderr output from
+          * the process
+          * @param err An InputStream which is attached to the process's stderr output
+          */
+        def processErrorOutput(err: InputStream): Unit = {
+          while (!inputClosed.get || !outputClosed.get || errorAbort.get) {
+            scala.io.Source.fromInputStream(err)
+              .getLines()
+              .foreach{msg => callback.invoke(ErrorOutput(msg))}
+          }
+          err.close()
+        }
+      }
   }
 }

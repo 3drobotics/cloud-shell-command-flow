@@ -5,7 +5,7 @@ import akka.stream.scaladsl.{Sink, Source}
 import akka.util.ByteString
 import io.dronekit.cloud.ExternalCommandFlow
 import org.scalatest._
-import java.io.File
+import java.io.{IOException, File}
 
 import scala.concurrent.Await
 import scala.concurrent.duration._
@@ -31,7 +31,7 @@ class CommandPipeSpec extends FlatSpec with Matchers {
     val source = Source.empty[ByteString]
     val stream = source.via(ExternalCommandFlow(Seq("/bin/cat"))).grouped(1000000).runWith(Sink.head)
     intercept[NoSuchElementException] {
-      Await.result(stream, 1 seconds)
+    val result = Await.result(stream, 1 seconds)
     }
   }
   val falseCommand =
@@ -59,7 +59,7 @@ class CommandPipeSpec extends FlatSpec with Matchers {
     val f = Source.single(ByteString("hello"))
       .via(ExternalCommandFlow(Seq(falseCommand)))
       .runWith(Sink.ignore)
-    val result = Await.result(f, 1 seconds)
+    Await.result(f, 1 seconds)
   }
 
 }
