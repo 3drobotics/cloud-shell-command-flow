@@ -1,4 +1,4 @@
-AkkaStreamsCommandPipe
+Shell Command Flow
 ======================
 Akka Streams flow which pipes data through a shell command
 
