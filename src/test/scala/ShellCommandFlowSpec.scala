@@ -4,10 +4,8 @@ import akka.actor.ActorSystem
 import akka.stream.ActorMaterializer
 import akka.stream.scaladsl.{Sink, Source}
 import akka.util.ByteString
-import com.typesafe.scalalogging.Logger
 import io.dronekit.cloud.ShellCommandFlow
 import org.scalatest._
-import org.slf4j.LoggerFactory
 
 import scala.concurrent.Await
 import scala.concurrent.duration._
@@ -19,21 +17,21 @@ import scala.language.postfixOps
  */
 class ShellCommandFlowSpec extends FlatSpec with Matchers {
   implicit val system = ActorSystem()
-  implicit val log: Logger = Logger(LoggerFactory.getLogger("io.dkc.cp"))
   implicit val materializer = ActorMaterializer()
 
   it should "echo data piped through /bin/cat" in {
-    val source = Source(1 to 10).map(num => ByteString(s"$num "))
+    val source = Source(1 to 100).map(num => ByteString(s"$num "))
     val stream = source.via(ShellCommandFlow(Seq("/bin/cat"))).grouped(1000000).runWith(Sink.head)
     val result = Await.result(stream, 1 seconds)
-    result.head shouldBe (1 to 10).mkString(" ") + " "
+    result.head shouldBe (1 to 100).mkString(" ") + " "
   }
 
   it should "throw a NoSuchElementException if the source is empty" in {
     val source = Source.empty[ByteString]
     val stream = source.via(ShellCommandFlow(Seq("/bin/cat"))).grouped(1000000).runWith(Sink.head)
     intercept[NoSuchElementException] {
-    val result = Await.result(stream, 1 seconds)
+      val result = Await.result(stream, 1 seconds)
+      println(s"result: $result")
     }
   }
   val falseCommand =
@@ -62,6 +60,13 @@ class ShellCommandFlowSpec extends FlatSpec with Matchers {
       .via(ShellCommandFlow(Seq(falseCommand)))
       .runWith(Sink.ignore)
     Await.result(f, 1 seconds)
+  }
+
+  it should "run even if stdout is encountered" in {
+    val f = Source.single(ByteString())
+      .via(ShellCommandFlow(Seq("/bin/cat", "/tmp/nosuchfile")))
+      .runWith(Sink.ignore)
+    Await.result(f, 1 second)
   }
 
 }

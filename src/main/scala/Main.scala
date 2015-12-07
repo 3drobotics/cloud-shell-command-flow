@@ -19,7 +19,6 @@ object Main extends App {
   implicit val system = ActorSystem()
   implicit val adapter = system.log
   implicit val materializer = ActorMaterializer()
-  implicit val log = Logger(LoggerFactory.getLogger("io.dkc.cp"))
 
   val source = Source(1 to 10000).map(num => ByteString(s"$num "))
   val stream = source.via(ShellCommandFlow(Seq("/bin/cat"))).grouped(1000000).runWith(Sink.head)

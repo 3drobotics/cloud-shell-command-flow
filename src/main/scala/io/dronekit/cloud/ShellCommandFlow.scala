@@ -9,6 +9,7 @@ import akka.stream.scaladsl.Flow
 import akka.stream.stage._
 import akka.util.ByteString
 import com.typesafe.scalalogging.Logger
+import org.slf4j.LoggerFactory
 
 import scala.collection.JavaConversions._
 import scala.sys.process.{Process, ProcessIO}
@@ -18,27 +19,27 @@ import scala.sys.process.{Process, ProcessIO}
  *
  */
 object ShellCommandFlow {
-  def apply(command: Seq[String])(implicit log: Logger): Flow[ByteString, String, Unit] = {
+  def apply(command: Seq[String]): Flow[ByteString, String, Unit] = {
     Flow.fromGraph(new ShellCommandFlow(command))
   }
 
   class ShellCommandFlowException(msg: String) extends RuntimeException(msg)
 
 
-  private class ShellCommandFlow(command: Seq[String], bufferSize: Int = 10)
-                                (implicit log: Logger) extends GraphStage[FlowShape[ByteString, String]] {
+  private class ShellCommandFlow(command: Seq[String], bufferSize: Int = 10) extends GraphStage[FlowShape[ByteString, String]] {
     val in: Inlet[ByteString] = Inlet("CommandInput")
     val out: Outlet[String] = Outlet("CommandOutput")
     override val shape: FlowShape[ByteString, String] = FlowShape(in, out)
 
     sealed trait Output
-    case class StandardOutput(out: String) extends Output
+    case object StandardOutput extends Output
     case class ErrorOutput(out: String) extends Output
     case object StandardOutputFinished extends Output
 
 
     override def createLogic(inheritedAttributes: Attributes): GraphStageLogic =
       new GraphStageLogic(shape) {
+        val log: Logger = Logger(LoggerFactory.getLogger(getClass))
         var upstreamFinished = new AtomicBoolean(false)
         var inputClosed = new AtomicBoolean(false)
         var outputClosed = new AtomicBoolean(false)
@@ -49,13 +50,11 @@ object ShellCommandFlow {
         val errorQueue = new LinkedBlockingDeque[String]()
         val callback = getAsyncCallback(outputAsyncInput)
 
-        val io = try {
-          new ProcessIO(processInput, processOutput, processErrorOutput)
-        } catch {
-          case e: IOException => throw new ShellCommandFlowException(e.toString)
+        override def preStart(): Unit = {
+          val io = new ProcessIO(processInput, processOutput, processErrorOutput)
+          // TODO: create a materialized value with the exit code
+          process.run(io)
         }
-        // TODO: create a materialized value with the exit code
-        val runningProcess = process.run(io)
 
         private def pushAndPull(): Unit = {
           if (outputQueue.isEmpty && !hasBeenPulled(in) && !isClosed(in)) {
@@ -69,25 +68,36 @@ object ShellCommandFlow {
           }
         }
 
+        private def pushAndComplete(): Unit = {
+          if (outputQueue.isEmpty) {
+            log.info("Completing stage")
+            completeStage()
+          }
+          else {
+            if (isAvailable(out)) {
+              val finalPush = outputQueue.descendingIterator().mkString("\n")
+              log.info(s"Pushing final value and completing")
+              push(out, finalPush)
+              completeStage()
+            }
+            else {
+              // Wait for onPull
+              log.info("waiting for onPull to complete stage")
+            }
+          }
+        }
+
         private def outputAsyncInput(data: Output): Unit = data match {
-          case StandardOutput(msg) =>
-            outputQueue.putFirst(msg)
+          case StandardOutput =>
             pushAndPull()
           case ErrorOutput(msg) =>
             log.error(msg)
             errorQueue.putFirst(msg)
           case StandardOutputFinished =>
-            while (!outputQueue.isEmpty && !isClosed(out)) {
-              if (isAvailable(out)) {
-                val finalPush = outputQueue.descendingIterator().mkString("\n")
-                log.debug(s"Pushing final value: $finalPush")
-                push(out, finalPush)
-              }
-              else
-                Thread.`yield`()
-            }
-            log.debug("completeStage")
-            completeStage()
+            log.debug("StandardOutputFinished")
+            outputClosed.set(true)
+            pushAndComplete()
+
         }
 
         setHandler(in, new InHandler{
@@ -114,7 +124,11 @@ object ShellCommandFlow {
         setHandler(out, new OutHandler {
           override def onPull(): Unit = {
             log.debug("onPull")
-            pushAndPull()
+            if (outputClosed.get) {
+              pushAndComplete()
+            }
+            else
+              pushAndPull()
           }
         })
 
@@ -126,7 +140,7 @@ object ShellCommandFlow {
           * InputStream (which is an OutputStream for us)
           * @param in OutputStream to write to, which is Input for the process
           */
-        def processInput(in: OutputStream): Unit = {
+        private def processInput(in: OutputStream): Unit = {
           while (!upstreamFinished.get && !errorAbort.get) {
             // Block until there is data available
             val data = inputQueue.takeLast().toArray[Byte]
@@ -153,25 +167,33 @@ object ShellCommandFlow {
           * is then read by onPull and pushed downstream.
           * @param out An InputStream which is connected to the process's stdout
           */
-        def processOutput(out: InputStream): Unit = {
+        private def processOutput(out: InputStream): Unit = {
           while (!inputClosed.get && !errorAbort.get) {
             scala.io.Source.fromInputStream(out)
               .getLines()
-              .foreach{line => callback.invoke(StandardOutput(line))}
+              .foreach { line =>
+                outputQueue.putFirst(line)
+                callback.invoke(StandardOutput)
+              }
             if (out.available() == 0)
               Thread.`yield`()
           }
           // Finish up anything remaining in the stream
+          log.info("input closed, reading the rest of the output")
           while (out.available() > 0 && !errorAbort.get) {
             scala.io.Source.fromInputStream(out)
               .getLines()
-              .foreach{line => callback.invoke(StandardOutput(line))}
+              .foreach { line =>
+                outputQueue.putFirst(line)
+                callback.invoke(StandardOutput)
+              }
           }
           try {
             out.close()
           } catch {
             case e: IOException => log.warn("Ignoring IO Exception closing stream")
           }
+          log.info(s"output stream for $command is complete")
           callback.invoke(StandardOutputFinished)
         }
 
@@ -180,7 +202,7 @@ object ShellCommandFlow {
           * the process
           * @param err An InputStream which is attached to the process's stderr output
           */
-        def processErrorOutput(err: InputStream): Unit = {
+        private def processErrorOutput(err: InputStream): Unit = {
           while (!inputClosed.get || !outputClosed.get || errorAbort.get) {
             scala.io.Source.fromInputStream(err)
               .getLines()
