@@ -4,11 +4,11 @@ import java.io.{IOException, InputStream, OutputStream}
 import java.util.concurrent.LinkedBlockingDeque
 import java.util.concurrent.atomic.AtomicBoolean
 
-import akka.event.LoggingAdapter
 import akka.stream._
 import akka.stream.scaladsl.Flow
 import akka.stream.stage._
 import akka.util.ByteString
+import com.typesafe.scalalogging.Logger
 
 import scala.collection.JavaConversions._
 import scala.sys.process.{Process, ProcessIO}
@@ -17,8 +17,8 @@ import scala.sys.process.{Process, ProcessIO}
  * Created by Jason Martens <jason.martens@3dr.com> on 10/15/15.
  *
  */
-object ExternalCommandFlow {
-  def apply(command: Seq[String])(implicit log: LoggingAdapter): Flow[ByteString, String, Unit] = {
+object ShellCommandFlow {
+  def apply(command: Seq[String])(implicit log: Logger): Flow[ByteString, String, Unit] = {
     Flow.fromGraph(new ShellCommandFlow(command))
   }
 
@@ -26,7 +26,7 @@ object ExternalCommandFlow {
 
 
   private class ShellCommandFlow(command: Seq[String], bufferSize: Int = 10)
-                                (implicit log: LoggingAdapter) extends GraphStage[FlowShape[ByteString, String]] {
+                                (implicit log: Logger) extends GraphStage[FlowShape[ByteString, String]] {
     val in: Inlet[ByteString] = Inlet("CommandInput")
     val out: Outlet[String] = Outlet("CommandOutput")
     override val shape: FlowShape[ByteString, String] = FlowShape(in, out)
@@ -59,10 +59,12 @@ object ExternalCommandFlow {
 
         private def pushAndPull(): Unit = {
           if (outputQueue.isEmpty && !hasBeenPulled(in) && !isClosed(in)) {
+            log.debug("pulling")
             pull(in)
           }
           while (!outputQueue.isEmpty && !isClosed(out) && isAvailable(out)) {
             val output = outputQueue.takeLast()
+            log.debug(s"pushing $output")
             push(out, output)
           }
         }
@@ -78,11 +80,13 @@ object ExternalCommandFlow {
             while (!outputQueue.isEmpty && !isClosed(out)) {
               if (isAvailable(out)) {
                 val finalPush = outputQueue.descendingIterator().mkString("\n")
+                log.debug(s"Pushing final value: $finalPush")
                 push(out, finalPush)
               }
               else
                 Thread.`yield`()
             }
+            log.debug("completeStage")
             completeStage()
         }
 
@@ -101,6 +105,7 @@ object ExternalCommandFlow {
           override def onUpstreamFinish: Unit = {
             upstreamFinished.set(true)
             // This un-blocks processInput allowing it to exit
+            log.debug("onUpstreamFinish")
             inputQueue.putFirst(ByteString())
           }
 
@@ -108,6 +113,7 @@ object ExternalCommandFlow {
 
         setHandler(out, new OutHandler {
           override def onPull(): Unit = {
+            log.debug("onPull")
             pushAndPull()
           }
         })
@@ -164,7 +170,7 @@ object ExternalCommandFlow {
           try {
             out.close()
           } catch {
-            case e: IOException => log.warning("Ignoring IO Exception closing stream")
+            case e: IOException => log.warn("Ignoring IO Exception closing stream")
           }
           callback.invoke(StandardOutputFinished)
         }
